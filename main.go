@@ -9,28 +9,25 @@ import (
 	"github.com/spf13/viper"
 )
 
-type bot struct {
-	chatId           int64
-	allowedUsernames []string
-	echotron.API
-}
+type UrlExtractor func(msg *echotron.Message) []string
 
-func getUrlsFromEntities(msgText string, entities []*echotron.MessageEntity) []string {
+func GetUrlsFromEntities(msg *echotron.Message) []string {
 	urls := make([]string, 0)
-	for _, entity := range entities {
+	for _, entity := range msg.Entities {
 		if entity.Type != "url" && entity.Type != "text_link" {
 			continue
 		}
 		url := entity.URL
 		if url == "" {
-			url = msgText[entity.Offset : entity.Offset+entity.Length]
+			url = msg.Text[entity.Offset : entity.Offset+entity.Length]
 		}
 		urls = append(urls, url)
 	}
 	return urls
 }
 
-func getUrlsFromLinkPreview(link *echotron.LinkPreviewOptions) []string {
+func GetUrlsFromLinkPreview(msg *echotron.Message) []string {
+	link := msg.LinkPreviewOptions
 	urls := make([]string, 0)
 	if link != nil && link.URL != "" && !link.IsDisabled {
 		urls = append(urls, link.URL)
@@ -38,11 +35,14 @@ func getUrlsFromLinkPreview(link *echotron.LinkPreviewOptions) []string {
 	return urls
 }
 
-func getUrlsFromMessage(msg *echotron.Message) []string {
-	urls := make([]string, 0)
-	urls = append(urls, getUrlsFromLinkPreview(msg.LinkPreviewOptions)...)
-	urls = append(urls, getUrlsFromEntities(msg.Text, msg.Entities)...)
-	return distinct(urls)
+func GetUrlsWithExtractors(extractors ...UrlExtractor) UrlExtractor {
+	return func(msg *echotron.Message) []string {
+		urls := make([]string, 0)
+		for _, extractor := range extractors {
+			urls = append(urls, extractor(msg)...)
+		}
+		return distinct(urls)
+	}
 }
 
 func distinct(arr []string) []string {
@@ -66,6 +66,42 @@ func contains(arr []string, str string) bool {
 	return false
 }
 
+type LinkdingRepository interface {
+}
+
+type linkdingRepository struct {
+	url      string
+	apiToken string
+}
+
+func NewLinkdingRepository(url, apiToken string) LinkdingRepository {
+	return &linkdingRepository{url, apiToken}
+}
+
+type LinkService interface {
+	Save(url string) error
+}
+
+type linkdingLinkService struct {
+	repository LinkdingRepository
+}
+
+func NewLinkdingLinkService(repository LinkdingRepository) LinkService {
+	return &linkdingLinkService{repository}
+}
+
+func (s *linkdingLinkService) Save(url string) error {
+	return nil
+}
+
+type bot struct {
+	chatId           int64
+	allowedUsernames []string
+	urlExtractor     UrlExtractor
+	linkService      LinkService
+	echotron.API
+}
+
 func (b *bot) Update(update *echotron.Update) {
 	msg := update.Message
 	if msg == nil {
@@ -79,7 +115,7 @@ func (b *bot) Update(update *echotron.Update) {
 
 	log.Printf("Received message: %v", msg)
 
-	urls := getUrlsFromMessage(msg)
+	urls := b.urlExtractor(msg)
 	if len(urls) == 0 {
 		b.SendMessage("No URLs found in the message", b.chatId, nil)
 		return
@@ -91,17 +127,37 @@ func (b *bot) Update(update *echotron.Update) {
 }
 
 type botFactory struct {
-	token            string
+	tgToken          string
 	allowedUsernames []string
+	api              echotron.API
+	urlExtractor     UrlExtractor
+	linkService      LinkService
 }
 
-func (b *botFactory) newBotFn() echotron.NewBotFn {
-	api := echotron.NewAPI(b.token)
+func NewBotFactory(
+	tgToken string,
+	allowedUsernames []string,
+	urlExtractor UrlExtractor,
+	linkService LinkService,
+	api echotron.API,
+) *botFactory {
+	return &botFactory{
+		tgToken:          tgToken,
+		allowedUsernames: allowedUsernames,
+		urlExtractor:     urlExtractor,
+		linkService:      linkService,
+		api:              api,
+	}
+}
+
+func (b *botFactory) NewBotFn() echotron.NewBotFn {
 	return func(chatId int64) echotron.Bot {
 		return &bot{
-			chatId,
-			b.allowedUsernames,
-			api,
+			chatId:           chatId,
+			allowedUsernames: b.allowedUsernames,
+			urlExtractor:     b.urlExtractor,
+			linkService:      b.linkService,
+			API:              b.api,
 		}
 	}
 }
@@ -111,7 +167,7 @@ type envConfig struct {
 	AllowedUsernames []string `mapstructure:"ALLOWED_USERNAMES"`
 }
 
-func Parse(i interface{}) error {
+func parseConfig(i interface{}) error {
 	r := reflect.TypeOf(i)
 	for r.Kind() == reflect.Ptr {
 		r = r.Elem()
@@ -135,7 +191,7 @@ func loadEnvVariables() *envConfig {
 		log.Fatalf("Failed to read config file: %v", err)
 	}
 	config := &envConfig{}
-	if err := Parse(config); err != nil {
+	if err := parseConfig(config); err != nil {
 		log.Fatalf("Failed to unmarshal config: %v", err)
 	}
 	return config
@@ -156,25 +212,29 @@ func main() {
 	log.Println("Config loaded successfully")
 	log.Printf("Allowed usernames: %v", config.AllowedUsernames)
 
-	botFactory := botFactory{
-		token:            config.Token,
-		allowedUsernames: config.AllowedUsernames,
-	}
-
-	dsp := echotron.NewDispatcher(config.Token, botFactory.newBotFn())
-	log.Println("Dispatcher constructed")
-
 	api := echotron.NewAPI(config.Token)
+
 	res, err := api.GetMe()
 	if err != nil {
 		log.Fatalf("Failed to get bot info: %v", err)
 	}
 	log.Printf("Bot username: @%s", res.Result.Username)
 
+	botFactory := NewBotFactory(
+		config.Token,
+		config.AllowedUsernames,
+		GetUrlsWithExtractors(GetUrlsFromEntities, GetUrlsFromLinkPreview),
+		NewLinkdingLinkService(NewLinkdingRepository("", "")), // TODO: config
+		api,
+	)
+
+	dsp := echotron.NewDispatcher(config.Token, botFactory.NewBotFn())
+	log.Println("Dispatcher constructed")
+
 	for {
 		log.Println("Polling...")
 		log.Println(dsp.Poll())
-		// In case of connection issues wait 5 seconds before trying to reconnect.
+
 		time.Sleep(5 * time.Second)
 	}
 }
