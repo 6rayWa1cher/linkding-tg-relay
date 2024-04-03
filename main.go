@@ -1,12 +1,21 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"github.com/dyatlov/go-htmlinfo/htmlinfo"
 	"log"
+	"net/http"
+	"net/url"
 	"reflect"
 	"time"
 
 	"github.com/NicoNex/echotron/v3"
 	"github.com/spf13/viper"
+)
+
+const (
+	ApplicationJson = "application/json"
 )
 
 type UrlExtractor func(msg *echotron.Message) []string
@@ -66,16 +75,92 @@ func contains(arr []string, str string) bool {
 	return false
 }
 
+type CreateBookmarkPayload struct {
+	URL         string   `json:"url"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	Notes       string   `json:"notes"`
+	IsArchived  bool     `json:"is_archived"`
+	Unread      bool     `json:"unread"`
+	Shared      bool     `json:"shared"`
+	TagNames    []string `json:"tag_names"`
+}
+
 type LinkdingRepository interface {
+	CreateBookmark(payload *CreateBookmarkPayload) error
 }
 
 type linkdingRepository struct {
-	url      string
+	baseUrl  url.URL
 	apiToken string
 }
 
-func NewLinkdingRepository(url, apiToken string) LinkdingRepository {
-	return &linkdingRepository{url, apiToken}
+func (l *linkdingRepository) CreateBookmark(payload *CreateBookmarkPayload) error {
+	postBody, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	postBodyBuffer := bytes.NewBuffer(postBody)
+	resp, err := http.Post(
+		l.baseUrl.JoinPath("api", "bookmarks").Path,
+		ApplicationJson,
+		postBodyBuffer,
+	)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	return nil
+}
+
+func NewLinkdingRepository(baseUrl url.URL, apiToken string) LinkdingRepository {
+	return &linkdingRepository{baseUrl, apiToken}
+}
+
+type PageInfo struct {
+	url         string
+	title       string
+	description string
+}
+
+type PageInfoService interface {
+	GetPageInfo(url string) (*PageInfo, error)
+}
+
+type pageInfoService struct {
+}
+
+func NewPageInfoService() PageInfoService {
+	return &pageInfoService{}
+}
+
+func (p *pageInfoService) GetPageInfo(url string) (*PageInfo, error) {
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	info := htmlinfo.NewHTMLInfo()
+	info.AllowOembedFetching = true
+
+	ct := resp.Header.Get("Content-Type")
+	if err = info.Parse(resp.Body, &url, &ct); err != nil {
+		return nil, err
+	}
+
+	oembed := info.GenerateOembedFor(url)
+	output := &PageInfo{
+		url: url,
+	}
+	if oembed != nil {
+		output.title = oembed.Title
+		output.description = oembed.Description
+	} else {
+		output.title = info.Title
+		output.description = info.Description
+	}
+	return output, nil
 }
 
 type LinkService interface {
@@ -83,15 +168,30 @@ type LinkService interface {
 }
 
 type linkdingLinkService struct {
-	repository LinkdingRepository
+	repository      LinkdingRepository
+	pageInfoService PageInfoService
 }
 
-func NewLinkdingLinkService(repository LinkdingRepository) LinkService {
-	return &linkdingLinkService{repository}
+func NewLinkdingLinkService(repository LinkdingRepository, pageInfoService PageInfoService) LinkService {
+	return &linkdingLinkService{repository, pageInfoService}
 }
 
-func (s *linkdingLinkService) Save(url string) error {
-	return nil
+func (l *linkdingLinkService) Save(url string) error {
+	pageInfo, err := l.pageInfoService.GetPageInfo(url)
+	if err != nil {
+		return err
+	}
+	payload := CreateBookmarkPayload{
+		URL:         url,
+		Title:       pageInfo.title,
+		Description: pageInfo.description,
+		Notes:       "",
+		IsArchived:  false,
+		Unread:      true,
+		Shared:      false,
+		TagNames:    []string{},
+	}
+	return l.repository.CreateBookmark(&payload)
 }
 
 type bot struct {
@@ -102,6 +202,13 @@ type bot struct {
 	echotron.API
 }
 
+func (b *bot) maybeSendMessage(text string) {
+	_, err := b.SendMessage(text, b.chatId, nil)
+	if err != nil {
+		log.Printf("Send message error: %v", err)
+	}
+}
+
 func (b *bot) Update(update *echotron.Update) {
 	msg := update.Message
 	if msg == nil {
@@ -109,7 +216,7 @@ func (b *bot) Update(update *echotron.Update) {
 	}
 
 	if !contains(b.allowedUsernames, msg.From.Username) {
-		b.SendMessage("You are not allowed to use this bot", b.chatId, nil)
+		b.maybeSendMessage("You are not allowed to use this bot")
 		return
 	}
 
@@ -117,13 +224,22 @@ func (b *bot) Update(update *echotron.Update) {
 
 	urls := b.urlExtractor(msg)
 	if len(urls) == 0 {
-		b.SendMessage("No URLs found in the message", b.chatId, nil)
+		b.maybeSendMessage("No URLs found in the message")
 		return
 	}
 
-	for _, url := range urls {
-		b.SendMessage(url, b.chatId, nil)
+	firstUrl := urls[0]
+	err := b.linkService.Save(firstUrl)
+	if err != nil {
+		log.Printf("Couldn't save a link: %v", err)
+		b.maybeSendMessage("Error")
+		return
 	}
+	b.maybeSendMessage("Saved!")
+}
+
+type BotFactory interface {
+	NewBot() echotron.NewBotFn
 }
 
 type botFactory struct {
@@ -140,7 +256,7 @@ func NewBotFactory(
 	urlExtractor UrlExtractor,
 	linkService LinkService,
 	api echotron.API,
-) *botFactory {
+) BotFactory {
 	return &botFactory{
 		tgToken:          tgToken,
 		allowedUsernames: allowedUsernames,
@@ -150,7 +266,7 @@ func NewBotFactory(
 	}
 }
 
-func (b *botFactory) NewBotFn() echotron.NewBotFn {
+func (b *botFactory) NewBot() echotron.NewBotFn {
 	return func(chatId int64) echotron.Bot {
 		return &bot{
 			chatId:           chatId,
@@ -165,6 +281,8 @@ func (b *botFactory) NewBotFn() echotron.NewBotFn {
 type envConfig struct {
 	Token            string   `mapstructure:"TOKEN"`
 	AllowedUsernames []string `mapstructure:"ALLOWED_USERNAMES"`
+	LinkdingBaseUrl  url.URL  `mapstructure:"LINKDING_BASE_URL"`
+	LinkdingApiToken string   `mapstructure:"LINKDING_API_TOKEN"`
 }
 
 func parseConfig(i interface{}) error {
@@ -220,15 +338,19 @@ func main() {
 	}
 	log.Printf("Bot username: @%s", res.Result.Username)
 
+	linkdingRepository := NewLinkdingRepository(config.LinkdingBaseUrl, config.LinkdingApiToken)
+	pageInfoService := NewPageInfoService()
+	linkService := NewLinkdingLinkService(linkdingRepository, pageInfoService)
+
 	botFactory := NewBotFactory(
 		config.Token,
 		config.AllowedUsernames,
 		GetUrlsWithExtractors(GetUrlsFromEntities, GetUrlsFromLinkPreview),
-		NewLinkdingLinkService(NewLinkdingRepository("", "")), // TODO: config
+		linkService,
 		api,
 	)
 
-	dsp := echotron.NewDispatcher(config.Token, botFactory.NewBotFn())
+	dsp := echotron.NewDispatcher(config.Token, botFactory.NewBot())
 	log.Println("Dispatcher constructed")
 
 	for {
