@@ -3,7 +3,10 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"github.com/dyatlov/go-htmlinfo/htmlinfo"
+	"github.com/goware/urlx"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -26,11 +29,11 @@ func GetUrlsFromEntities(msg *echotron.Message) []string {
 		if entity.Type != "url" && entity.Type != "text_link" {
 			continue
 		}
-		url := entity.URL
-		if url == "" {
-			url = msg.Text[entity.Offset : entity.Offset+entity.Length]
+		entityUrl := entity.URL
+		if entityUrl == "" {
+			entityUrl = msg.Text[entity.Offset : entity.Offset+entity.Length]
 		}
-		urls = append(urls, url)
+		urls = append(urls, entityUrl)
 	}
 	return urls
 }
@@ -91,7 +94,7 @@ type LinkdingRepository interface {
 }
 
 type linkdingRepository struct {
-	baseUrl  url.URL
+	baseUrl  string
 	apiToken string
 }
 
@@ -101,19 +104,35 @@ func (l *linkdingRepository) CreateBookmark(payload *CreateBookmarkPayload) erro
 		return err
 	}
 	postBodyBuffer := bytes.NewBuffer(postBody)
-	resp, err := http.Post(
-		l.baseUrl.JoinPath("api", "bookmarks").Path,
-		ApplicationJson,
-		postBodyBuffer,
-	)
+
+	path, err := url.JoinPath(l.baseUrl, "api/bookmarks/")
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", path, postBodyBuffer)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", ApplicationJson)
+	req.Header.Set("Authorization", fmt.Sprintf("Token %s", l.apiToken))
+	client := &http.Client{}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != 201 {
+		log.Printf("%s", respBody)
+		return fmt.Errorf("unexpected status code %d", resp.StatusCode)
+	}
 	return nil
 }
 
-func NewLinkdingRepository(baseUrl url.URL, apiToken string) LinkdingRepository {
+func NewLinkdingRepository(baseUrl, apiToken string) LinkdingRepository {
 	return &linkdingRepository{baseUrl, apiToken}
 }
 
@@ -177,12 +196,16 @@ func NewLinkdingLinkService(repository LinkdingRepository, pageInfoService PageI
 }
 
 func (l *linkdingLinkService) Save(url string) error {
-	pageInfo, err := l.pageInfoService.GetPageInfo(url)
+	normalizedUrl, err := urlx.NormalizeString(url)
+	if err != nil {
+		return err
+	}
+	pageInfo, err := l.pageInfoService.GetPageInfo(normalizedUrl)
 	if err != nil {
 		return err
 	}
 	payload := CreateBookmarkPayload{
-		URL:         url,
+		URL:         normalizedUrl,
 		Title:       pageInfo.title,
 		Description: pageInfo.description,
 		Notes:       "",
@@ -281,7 +304,7 @@ func (b *botFactory) NewBot() echotron.NewBotFn {
 type envConfig struct {
 	Token            string   `mapstructure:"TOKEN"`
 	AllowedUsernames []string `mapstructure:"ALLOWED_USERNAMES"`
-	LinkdingBaseUrl  url.URL  `mapstructure:"LINKDING_BASE_URL"`
+	LinkdingBaseUrl  string   `mapstructure:"LINKDING_BASE_URL"`
 	LinkdingApiToken string   `mapstructure:"LINKDING_API_TOKEN"`
 }
 
@@ -341,11 +364,11 @@ func main() {
 	linkdingRepository := NewLinkdingRepository(config.LinkdingBaseUrl, config.LinkdingApiToken)
 	pageInfoService := NewPageInfoService()
 	linkService := NewLinkdingLinkService(linkdingRepository, pageInfoService)
-
+	urlExtractor := GetUrlsWithExtractors(GetUrlsFromEntities, GetUrlsFromLinkPreview)
 	botFactory := NewBotFactory(
 		config.Token,
 		config.AllowedUsernames,
-		GetUrlsWithExtractors(GetUrlsFromEntities, GetUrlsFromLinkPreview),
+		urlExtractor,
 		linkService,
 		api,
 	)
