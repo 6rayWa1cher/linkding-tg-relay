@@ -4,6 +4,8 @@ go 1.22.0
 
 require (
 	github.com/NicoNex/echotron/v3 v3.29.0
+	github.com/dyatlov/go-htmlinfo v0.0.0-20180517114536-d9417c75de65
+	github.com/goware/urlx v0.3.2
 	github.com/spf13/viper v1.18.2
 )
 
@@ -13,13 +15,12 @@ require (
 	github.com/PuerkitoBio/purell v1.1.1 // indirect
 	github.com/PuerkitoBio/urlesc v0.0.0-20170810143723-de5bf2ad4578 // indirect
 	github.com/andybalholm/cascadia v1.3.2 // indirect
-	github.com/dyatlov/go-htmlinfo v0.0.0-20180517114536-d9417c75de65 // indirect
 	github.com/dyatlov/go-oembed v0.0.0-20191103150536-a57c85b3b37c // indirect
 	github.com/dyatlov/go-opengraph/opengraph v0.0.0-20220524092352-606d7b1e5f8a // indirect
 	github.com/dyatlov/go-readability v0.0.0-20220519115547-c2dce56b8cdd // indirect
 	github.com/fsnotify/fsnotify v1.7.0 // indirect
-	github.com/goware/urlx v0.3.2 // indirect
 	github.com/hashicorp/hcl v1.0.0 // indirect
+	github.com/joomcode/errorx v1.1.1
 	github.com/magiconair/properties v1.8.7 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/pelletier/go-toml/v2 v2.1.0 // indirect

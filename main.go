@@ -4,14 +4,17 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/dyatlov/go-htmlinfo/htmlinfo"
-	"github.com/goware/urlx"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"reflect"
 	"time"
+	"unicode/utf16"
+
+	"github.com/dyatlov/go-htmlinfo/htmlinfo"
+	"github.com/goware/urlx"
+	"github.com/joomcode/errorx"
 
 	"github.com/NicoNex/echotron/v3"
 	"github.com/spf13/viper"
@@ -19,19 +22,24 @@ import (
 
 const (
 	ApplicationJson = "application/json"
+	Created         = 201
 )
 
 type UrlExtractor func(msg *echotron.Message) []string
 
 func GetUrlsFromEntities(msg *echotron.Message) []string {
 	urls := make([]string, 0)
-	for _, entity := range msg.Entities {
+	allEntities := make([]*echotron.MessageEntity, 0, len(msg.Entities)+len(msg.CaptionEntities))
+	allEntities = append(allEntities, msg.Entities...)
+	allEntities = append(allEntities, msg.CaptionEntities...)
+	for _, entity := range allEntities {
 		if entity.Type != "url" && entity.Type != "text_link" {
 			continue
 		}
 		entityUrl := entity.URL
 		if entityUrl == "" {
-			entityUrl = msg.Text[entity.Offset : entity.Offset+entity.Length]
+			// offset and length are in UTF-16 code units
+			entityUrl = sliceUtf16(msg.Text, entity.Offset, entity.Offset+entity.Length)
 		}
 		urls = append(urls, entityUrl)
 	}
@@ -47,6 +55,7 @@ func GetUrlsFromLinkPreview(msg *echotron.Message) []string {
 	return urls
 }
 
+// GetUrlsWithExtractors returns a new UrlExtractor that combines the results of the provided extractors (order preserved)
 func GetUrlsWithExtractors(extractors ...UrlExtractor) UrlExtractor {
 	return func(msg *echotron.Message) []string {
 		urls := make([]string, 0)
@@ -55,6 +64,10 @@ func GetUrlsWithExtractors(extractors ...UrlExtractor) UrlExtractor {
 		}
 		return distinct(urls)
 	}
+}
+
+func sliceUtf16(s string, start, end int) string {
+	return string(utf16.Decode(utf16.Encode([]rune(s))[start:end]))
 }
 
 func distinct(arr []string) []string {
@@ -101,33 +114,38 @@ type linkdingRepository struct {
 func (l *linkdingRepository) CreateBookmark(payload *CreateBookmarkPayload) error {
 	postBody, err := json.Marshal(payload)
 	if err != nil {
-		return err
+		return errorx.Decorate(err, "failed to marshal payload")
 	}
 	postBodyBuffer := bytes.NewBuffer(postBody)
 
 	path, err := url.JoinPath(l.baseUrl, "api/bookmarks/")
 	if err != nil {
-		return err
+		return errorx.Decorate(err, "failed to join path")
 	}
+
 	req, err := http.NewRequest("POST", path, postBodyBuffer)
 	if err != nil {
-		return err
+		return errorx.Decorate(err, "failed to create request")
 	}
+
 	req.Header.Set("Content-Type", ApplicationJson)
 	req.Header.Set("Authorization", fmt.Sprintf("Token %s", l.apiToken))
+
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return errorx.Decorate(err, "failed to send request")
 	}
 	defer resp.Body.Close()
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return errorx.Decorate(err, "failed to read response body")
 	}
-	if resp.StatusCode != 201 {
+
+	if resp.StatusCode != http.StatusCreated {
 		log.Printf("%s", respBody)
-		return fmt.Errorf("unexpected status code %d", resp.StatusCode)
+		return errorx.IllegalState.New("unexpected status code %d", resp.StatusCode)
 	}
 	return nil
 }
@@ -156,7 +174,7 @@ func NewPageInfoService() PageInfoService {
 func (p *pageInfoService) GetPageInfo(url string) (*PageInfo, error) {
 	resp, err := http.Get(url)
 	if err != nil {
-		return nil, err
+		return nil, errorx.Decorate(err, "failed to fetch URL")
 	}
 	defer resp.Body.Close()
 
@@ -165,7 +183,7 @@ func (p *pageInfoService) GetPageInfo(url string) (*PageInfo, error) {
 
 	ct := resp.Header.Get("Content-Type")
 	if err = info.Parse(resp.Body, &url, &ct); err != nil {
-		return nil, err
+		return nil, errorx.Decorate(err, "failed to parse page info")
 	}
 
 	oembed := info.GenerateOembedFor(url)
@@ -198,11 +216,11 @@ func NewLinkdingLinkService(repository LinkdingRepository, pageInfoService PageI
 func (l *linkdingLinkService) Save(url string) error {
 	normalizedUrl, err := urlx.NormalizeString(url)
 	if err != nil {
-		return err
+		return errorx.Decorate(err, "failed to normalize URL")
 	}
 	pageInfo, err := l.pageInfoService.GetPageInfo(normalizedUrl)
 	if err != nil {
-		return err
+		return errorx.Decorate(err, "failed to get page info")
 	}
 	payload := CreateBookmarkPayload{
 		URL:         normalizedUrl,
@@ -254,7 +272,7 @@ func (b *bot) Update(update *echotron.Update) {
 	firstUrl := urls[0]
 	err := b.linkService.Save(firstUrl)
 	if err != nil {
-		log.Printf("Couldn't save a link: %v", err)
+		log.Printf("Couldn't save a link: %+v", err)
 		b.maybeSendMessage("Error")
 		return
 	}
@@ -316,7 +334,7 @@ func parseConfig(i interface{}) error {
 	for i := 0; i < r.NumField(); i++ {
 		env := r.Field(i).Tag.Get("mapstructure")
 		if err := viper.BindEnv(env); err != nil {
-			return err
+			return errorx.Decorate(err, "failed to bind env variable")
 		}
 	}
 	return viper.Unmarshal(i)
@@ -329,27 +347,37 @@ func loadEnvVariables() *envConfig {
 	viper.SetEnvPrefix("ltr")
 	viper.AutomaticEnv()
 	if err := viper.ReadInConfig(); err != nil {
-		log.Fatalf("Failed to read config file: %v", err)
+		log.Fatalf("%+v", errorx.Decorate(err, "failed to read config"))
 	}
 	config := &envConfig{}
 	if err := parseConfig(config); err != nil {
-		log.Fatalf("Failed to unmarshal config: %v", err)
+		log.Fatalf("%+v", errorx.Decorate(err, "failed to parse config"))
 	}
 	return config
 }
 
-func validateConfig(config *envConfig) {
+func validateConfig(config *envConfig) error {
 	if config.Token == "" {
-		log.Fatal("Token is required")
+		return errorx.IllegalArgument.New("env TOKEN is required")
 	}
 	if len(config.AllowedUsernames) == 0 {
-		log.Fatal("At least one allowed username is required")
+		return errorx.IllegalArgument.New("at least one allowed username is required (env ALLOWED_USERNAMES)")
 	}
+	if config.LinkdingApiToken == "" {
+		return errorx.IllegalArgument.New("env LINKDING_API_TOKEN is required")
+	}
+	if config.LinkdingBaseUrl == "" {
+		return errorx.IllegalArgument.New("env LINKDING_BASE_URL is required")
+	}
+	return nil
 }
 
 func main() {
 	config := loadEnvVariables()
-	validateConfig(config)
+	err := validateConfig(config)
+	if err != nil {
+		log.Fatalf("%+v", errorx.Decorate(err, "config validation failed"))
+	}
 	log.Println("Config loaded successfully")
 	log.Printf("Allowed usernames: %v", config.AllowedUsernames)
 
@@ -357,14 +385,14 @@ func main() {
 
 	res, err := api.GetMe()
 	if err != nil {
-		log.Fatalf("Failed to get bot info: %v", err)
+		log.Fatalf("%+v", errorx.Decorate(err, "failed to get bot info"))
 	}
 	log.Printf("Bot username: @%s", res.Result.Username)
 
 	linkdingRepository := NewLinkdingRepository(config.LinkdingBaseUrl, config.LinkdingApiToken)
 	pageInfoService := NewPageInfoService()
 	linkService := NewLinkdingLinkService(linkdingRepository, pageInfoService)
-	urlExtractor := GetUrlsWithExtractors(GetUrlsFromEntities, GetUrlsFromLinkPreview)
+	urlExtractor := GetUrlsWithExtractors(GetUrlsFromLinkPreview, GetUrlsFromEntities)
 	botFactory := NewBotFactory(
 		config.Token,
 		config.AllowedUsernames,
