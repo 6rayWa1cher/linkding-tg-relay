@@ -25,6 +25,6 @@ RUN addgroup \
     --uid "$UID" \
     bot \
 &&  chown -R bot:bot /app
-USER ${USER_ID}:${GROUP_ID}
+USER bot:bot
 COPY app.env.example /app/app.env
 ENTRYPOINT ["/app/bot"]
