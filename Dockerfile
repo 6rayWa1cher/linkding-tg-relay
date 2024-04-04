@@ -1,11 +1,12 @@
-FROM golang:1.22 as builder
+FROM --platform=$BUILDPLATFORM golang:1.22-alpine as builder
 WORKDIR /app
 
 COPY go.mod go.sum ./
 RUN go mod download
 COPY main.go .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /app/bot
+ARG TARGETOS TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -o /app/bot
 
 FROM alpine:3.19
 WORKDIR /app
