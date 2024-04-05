@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"reflect"
 	"time"
 	"unicode/utf16"
@@ -15,6 +15,7 @@ import (
 	"github.com/dyatlov/go-htmlinfo/htmlinfo"
 	"github.com/goware/urlx"
 	"github.com/joomcode/errorx"
+	log "github.com/sirupsen/logrus"
 
 	"github.com/NicoNex/echotron/v3"
 	"github.com/spf13/viper"
@@ -22,7 +23,6 @@ import (
 
 const (
 	ApplicationJson = "application/json"
-	Created         = 201
 )
 
 type UrlExtractor func(msg *echotron.Message) []string
@@ -214,14 +214,22 @@ func NewLinkdingLinkService(repository LinkdingRepository, pageInfoService PageI
 }
 
 func (l *linkdingLinkService) Save(url string) error {
+	log.Debugf("Saving url: %s", url)
+
 	normalizedUrl, err := urlx.NormalizeString(url)
 	if err != nil {
 		return errorx.Decorate(err, "failed to normalize URL")
 	}
+	log.Debugf("Normalized URL: %s", normalizedUrl)
+
+	fromTime := time.Now()
 	pageInfo, err := l.pageInfoService.GetPageInfo(normalizedUrl)
 	if err != nil {
 		return errorx.Decorate(err, "failed to get page info")
 	}
+	toTime := time.Now()
+	log.Debugf("Completed page info fetch in %s", toTime.Sub(fromTime))
+
 	payload := CreateBookmarkPayload{
 		URL:         normalizedUrl,
 		Title:       pageInfo.title,
@@ -232,7 +240,13 @@ func (l *linkdingLinkService) Save(url string) error {
 		Shared:      false,
 		TagNames:    []string{},
 	}
-	return l.repository.CreateBookmark(&payload)
+
+	fromTime = time.Now()
+	err = l.repository.CreateBookmark(&payload)
+	toTime = time.Now()
+	log.WithField("error", err).Debugf("Completed bookmark creation in %s", toTime.Sub(fromTime))
+
+	return err
 }
 
 type bot struct {
@@ -257,14 +271,16 @@ func (b *bot) Update(update *echotron.Update) {
 	}
 
 	if !contains(b.allowedUsernames, msg.From.Username) {
+		log.Debugf("Username %s is not allowed", msg.From.Username)
 		b.maybeSendMessage("You are not allowed to use this bot")
 		return
 	}
 
-	log.Printf("Received message: %v", msg)
+	log.Debugf("Received message: %v", msg)
 
 	urls := b.urlExtractor(msg)
 	if len(urls) == 0 {
+		log.Debug("No URLs found")
 		b.maybeSendMessage("No URLs found in the message")
 		return
 	}
@@ -272,7 +288,7 @@ func (b *bot) Update(update *echotron.Update) {
 	firstUrl := urls[0]
 	err := b.linkService.Save(firstUrl)
 	if err != nil {
-		log.Printf("Couldn't save a link: %+v", err)
+		log.Debugf("Couldn't save a link: %+v", err)
 		b.maybeSendMessage("Error")
 		return
 	}
@@ -324,6 +340,7 @@ type envConfig struct {
 	AllowedUsernames []string `mapstructure:"ALLOWED_USERNAMES"`
 	LinkdingBaseUrl  string   `mapstructure:"LINKDING_BASE_URL"`
 	LinkdingApiToken string   `mapstructure:"LINKDING_API_TOKEN"`
+	DebugLogging     bool     `mapstructure:"DEBUG_LOGGING"`
 }
 
 func parseConfig(i interface{}) error {
@@ -373,7 +390,11 @@ func validateConfig(config *envConfig) error {
 }
 
 func main() {
+	log.SetOutput(os.Stdout)
 	config := loadEnvVariables()
+	if config.DebugLogging {
+		log.SetLevel(log.DebugLevel)
+	}
 	err := validateConfig(config)
 	if err != nil {
 		log.Fatalf("%+v", errorx.Decorate(err, "config validation failed"))

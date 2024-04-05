@@ -6,6 +6,7 @@ require (
 	github.com/NicoNex/echotron/v3 v3.29.0
 	github.com/dyatlov/go-htmlinfo v0.0.0-20180517114536-d9417c75de65
 	github.com/goware/urlx v0.3.2
+	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/viper v1.18.2
 )
 
